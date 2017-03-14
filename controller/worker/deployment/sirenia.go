@@ -9,6 +9,8 @@ import (
 	ct "github.com/flynn/flynn/controller/types"
 	"github.com/flynn/flynn/controller/worker/types"
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/host/volume"
+	"github.com/flynn/flynn/pkg/cluster"
 	"github.com/flynn/flynn/pkg/sirenia/client"
 	"github.com/flynn/flynn/pkg/sirenia/state"
 )
@@ -209,6 +211,71 @@ loop:
 		return nil
 	}
 
+	// subscribe to volume events so we can wait for snapshots to be
+	// created before scaling up the new release
+	volEvents := make(chan *ct.Event)
+	volStream, err := d.client.StreamEvents(ct.StreamEventsOptions{
+		AppID:       d.AppID,
+		ObjectTypes: []ct.EventType{ct.EventTypeVolume},
+	}, volEvents)
+	if err != nil {
+		log.Error("error connecting volume event stream: %s", err)
+		return err
+	}
+
+	cloneVolume := func(inst *discoverd.Instance) error {
+		log = log.New("inst.addr", inst.Addr)
+
+		log.Info("creating snapshot")
+		snap, err := client.NewClient(inst.Addr).CreateSnapshot()
+		if err != nil {
+			log.Error("error creating snapshot", "err", err)
+			return err
+		}
+
+		log.Info("creating new volume", "snapshot.id", snap.ID)
+		hostID, _ := cluster.ExtractHostID(inst.Meta["FLYNN_JOB_ID"])
+		host, err := cluster.NewClient().Host(hostID)
+		if err != nil {
+			log.Error("error creating new volume", "err", err)
+			return err
+		}
+		vol := &volume.Info{
+			SnapshotID: snap.ID,
+			Meta: map[string]string{
+				"flynn-controller.app":            d.AppID,
+				"flynn-controller.release":        d.NewReleaseID,
+				"flynn-controller.type":           processType,
+				"flynn-controller.path":           "/data",
+				"flynn-controller.delete_on_stop": "false",
+			},
+		}
+		if err := host.CreateVolume("default", vol); err != nil {
+			log.Error("error creating new volume", "err", err)
+			return err
+		}
+
+		log.Info("waiting for volume event", "vol.id", vol.ID)
+		timeout := time.After(time.Minute)
+		for {
+			select {
+			case event, ok := <-volEvents:
+				if !ok {
+					return fmt.Errorf("volume event stream closed unexpectedly: %s", volStream.Err)
+				}
+				var v ct.Volume
+				if err := json.Unmarshal(event.Data, &v); err != nil {
+					return err
+				}
+				if v.ID == vol.ID {
+					return nil
+				}
+			case <-timeout:
+				return errors.New("timed out waiting for volume event")
+			}
+		}
+	}
+
 	// asyncUpstream is the instance we will query for replication status
 	// of the new async, which will be the sync if there is only one
 	// async, or the tail async otherwise.
@@ -218,6 +285,9 @@ loop:
 	}
 	for i := 0; i < len(state.Async); i++ {
 		log.Info("replacing an Async node")
+		if err := cloneVolume(state.Async[i]); err != nil {
+			return err
+		}
 		newInst, err := startInstance()
 		if err != nil {
 			return err
@@ -233,6 +303,9 @@ loop:
 	}
 
 	log.Info("replacing the Sync node")
+	if err := cloneVolume(state.Sync); err != nil {
+		return err
+	}
 	_, err = startInstance()
 	if err != nil {
 		return err
@@ -251,6 +324,9 @@ loop:
 	}
 
 	log.Info("replacing the Primary node")
+	if err := cloneVolume(state.Primary); err != nil {
+		return err
+	}
 	_, err = startInstance()
 	if err != nil {
 		return err

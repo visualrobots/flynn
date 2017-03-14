@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/flynn/flynn/discoverd/client"
+	"github.com/flynn/flynn/host/volume"
 	"github.com/flynn/flynn/pkg/httpclient"
 	"github.com/flynn/flynn/pkg/httphelper"
 	"github.com/flynn/flynn/pkg/sirenia/state"
@@ -75,6 +76,11 @@ func (c *Client) WaitForReadWrite(timeout time.Duration) error {
 	return c.waitFor(func(status *Status) bool {
 		return status.Database.ReadWrite
 	}, timeout)
+}
+
+func (c *Client) CreateSnapshot() (*volume.Info, error) {
+	var res volume.Info
+	return &res, c.c.Post("/snapshot", nil, &res)
 }
 
 var ErrTimeout = errors.New("timeout waiting for expected status")
